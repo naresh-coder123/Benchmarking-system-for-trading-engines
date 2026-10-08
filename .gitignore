@@ -1,0 +1,27 @@
+@'
+# Go Compiled Binaries & Test Artifacts
+*.exe
+*.exe~~
+*.dll
+*.so
+*.dylib
+*.test
+*.out
+bin/
+
+# IDE & Editor Configuration Overrides
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS & System Files
+.DS_Store
+Thumbs.db
+
+# Temporary Dependencies & Runtime Outputs
+vendor/
+*.log
+coverage.txt
+coverage.out
+'@
