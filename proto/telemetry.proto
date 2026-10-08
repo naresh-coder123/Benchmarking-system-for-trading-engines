@@ -1,0 +1,29 @@
+syntax = "proto3";
+
+package telemetry;
+
+option go_package = "telemetry/proto";
+
+service TelemetryIngester {
+  // Streaming RPC where load generators continuously push histogram snapshots
+  rpc StreamMetrics (stream MetricSnapshot) returns (IngestAck);
+}
+
+message MetricSnapshot {
+  string team_id = 1;
+  string worker_id = 2;
+  int64 timestamp_ns = 3;
+  uint64 total_sent = 4;
+  uint64 total_acks = 5;
+  
+  // Raw serialized binary representation of HdrHistogram
+  bytes hdr_histogram_blob = 6;
+  
+  // Accuracy & Correctness
+  uint64 invalid_fills = 7;
+}
+
+message IngestAck {
+  bool success = 1;
+  string message = 2;
+}
