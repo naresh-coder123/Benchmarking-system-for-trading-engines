@@ -1,0 +1,15 @@
+FROM golang:1.26.3-alpine AS builder
+WORKDIR /app
+COPY . .
+RUN CGO_ENABLED=0 GOOS=linux go build -ldflags="-w -s" -o mock-exchange main.go
+
+FROM alpine:latest
+WORKDIR /app
+COPY --from=builder /app/mock-exchange .
+
+# Adjust Go Runtime GC and max threads
+ENV GOMAXPROCS=2
+ENV GOMEMLIMIT=800MiB
+
+EXPOSE 8080
+CMD ["./mock-exchange"]
