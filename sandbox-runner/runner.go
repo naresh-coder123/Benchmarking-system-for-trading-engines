@@ -1,4 +1,4 @@
-package main
+package runner
 
 import (
 	"context"
@@ -14,10 +14,15 @@ import (
 )
 
 const (
-	ContainerImage = "mock-exchange:latest"
-	HostPort       = "8080"
-	ContainerPort  = "8080/tcp"
+	ContainerPort = "8080/tcp"
 )
+
+type runDetails struct {
+	runID      string
+	teamID     string
+	exposePort string
+	imageURL   string
+}
 
 type SandboxRunner struct {
 	cli *client.Client
@@ -36,12 +41,12 @@ func NewSandboxRunner() (*SandboxRunner, error) {
 
 func (sr *SandboxRunner) StartSandbox(
 	ctx context.Context,
-	teamID string,
+	rd *runDetails,
 ) (string, error) {
 
 	containerName := fmt.Sprintf(
 		"sandbox-team-%s",
-		teamID,
+		rd.teamID,
 	)
 
 	// Remove existing container.
@@ -60,7 +65,7 @@ func (sr *SandboxRunner) StartSandbox(
 			network.MustParsePort("8080/tcp"): []network.PortBinding{
 				{
 					HostIP:   netip.MustParseAddr("127.0.0.1"),
-					HostPort: HostPort,
+					HostPort: rd.exposePort,
 				},
 			},
 		},
@@ -78,7 +83,7 @@ func (sr *SandboxRunner) StartSandbox(
 	// Container configuration.
 	config := &container.Config{
 		ExposedPorts: network.PortSet{
-			network.MustParsePort("8080/tcp"): struct{}{},
+			network.MustParsePort(ContainerPort): struct{}{},
 		},
 	}
 
@@ -86,7 +91,7 @@ func (sr *SandboxRunner) StartSandbox(
 	resp, err := sr.cli.ContainerCreate(
 		ctx,
 		client.ContainerCreateOptions{
-			Image:      ContainerImage,
+			Image:      rd.imageURL,
 			Config:     config,
 			HostConfig: hostConfig,
 			Name:       containerName,
@@ -178,7 +183,7 @@ func (sr *SandboxRunner) StopSandbox(
 	return nil
 }
 
-func main() {
+func run(rd *runDetails) (string, error) {
 
 	ctx := context.Background()
 
@@ -196,7 +201,7 @@ func main() {
 
 	containerID, err := runner.StartSandbox(
 		ctx,
-		"team-alpha",
+		rd,
 	)
 
 	if err != nil {
@@ -210,7 +215,7 @@ func main() {
 
 	if err := runner.WaitForReady(
 		"127.0.0.1",
-		HostPort,
+		rd.exposePort,
 		5*time.Second,
 	); err != nil {
 
@@ -225,8 +230,9 @@ func main() {
 		)
 	}
 
-	log.Println(
-		"Container is HEALTHY and listening on ws://127.0.0.1:8080/ws",
+	log.Printf(
+		"Container is HEALTHY and listening on %s/ws",
+		rd.exposePort,
 	)
 
 	log.Println(
