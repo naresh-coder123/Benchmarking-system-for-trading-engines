@@ -3,9 +3,10 @@ package runner
 import (
 	"context"
 	"fmt"
-	"log"
 	"net"
 	"net/netip"
+	"strconv"
+	"strings"
 	"time"
 
 	"github.com/moby/moby/api/types/container"
@@ -15,23 +16,26 @@ import (
 
 const (
 	ContainerPort = "8080/tcp"
+	DefaultImage  = "mock-exchange:latest"
 )
 
-type runDetails struct {
-	runID      string
-	teamID     string
-	exposePort string
-	imageURL   string
+type RunDetails struct {
+	RunID      string `json:"run_id"`
+	TeamID     string `json:"team_id"`
+	ExposePort int    `json:"expose_port"`
+	ImageURL   string `json:"image_url"`
 }
 
 type SandboxRunner struct {
 	cli *client.Client
 }
 
+// NewSandboxRunner initializes a Docker client.
+// Create one runner instance and reuse it for the lifecycle of a run.
 func NewSandboxRunner() (*SandboxRunner, error) {
 	cli, err := client.New(client.FromEnv)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("initialize Docker client: %w", err)
 	}
 
 	return &SandboxRunner{
@@ -39,33 +43,46 @@ func NewSandboxRunner() (*SandboxRunner, error) {
 	}, nil
 }
 
+// Close releases the Docker client's resources.
+func (sr *SandboxRunner) Close() {
+	if sr != nil && sr.cli != nil {
+		sr.cli.Close()
+	}
+}
+
+// StartSandbox creates and starts a contestant container.
+// It returns the Docker container ID.
 func (sr *SandboxRunner) StartSandbox(
 	ctx context.Context,
-	rd *runDetails,
+	rd *RunDetails,
 ) (string, error) {
+	if sr == nil || sr.cli == nil {
+		return "", fmt.Errorf("sandbox runner is not initialized")
+	}
 
+	if rd == nil {
+		return "", fmt.Errorf("run details cannot be nil")
+	}
+
+	image := strings.TrimSpace(rd.ImageURL)
+	if image == "" {
+		image = DefaultImage
+	}
+
+	// Generate a unique container name for each run.
 	containerName := fmt.Sprintf(
-		"sandbox-team-%s",
-		rd.teamID,
+		"sandbox-team-%s-%s",
+		safeName(rd.TeamID),
+		safeName(rd.RunID),
 	)
 
-	// Remove existing container.
-	_, _ = sr.cli.ContainerRemove(
-		ctx,
-		containerName,
-		client.ContainerRemoveOptions{
-			Force: true,
-		},
-	)
-
-	// Host configuration.
 	// Host-side configuration.
 	hostConfig := &container.HostConfig{
 		PortBindings: network.PortMap{
-			network.MustParsePort("8080/tcp"): []network.PortBinding{
+			network.MustParsePort(ContainerPort): []network.PortBinding{
 				{
 					HostIP:   netip.MustParseAddr("127.0.0.1"),
-					HostPort: rd.exposePort,
+					HostPort: strconv.Itoa(rd.ExposePort),
 				},
 			},
 		},
@@ -86,86 +103,117 @@ func (sr *SandboxRunner) StartSandbox(
 			network.MustParsePort(ContainerPort): struct{}{},
 		},
 	}
-
-	// Create container.
+	// Create the container.
 	resp, err := sr.cli.ContainerCreate(
 		ctx,
 		client.ContainerCreateOptions{
-			Image:      rd.imageURL,
+			Image:      image,
 			Config:     config,
 			HostConfig: hostConfig,
 			Name:       containerName,
 		},
 	)
-
 	if err != nil {
-		return "", fmt.Errorf(
-			"failed to create sandbox container: %w",
-			err,
-		)
+		return "", fmt.Errorf("create sandbox container: %w", err)
 	}
 
+	// Start the container.
 	_, err = sr.cli.ContainerStart(
 		ctx,
 		resp.ID,
 		client.ContainerStartOptions{},
 	)
 	if err != nil {
-		return "", fmt.Errorf(
-			"failed to start sandbox container: %w",
-			err,
+		// Best-effort cleanup if the container cannot start.
+		_, _ = sr.cli.ContainerRemove(
+			context.Background(),
+			resp.ID,
+			client.ContainerRemoveOptions{
+				Force: true,
+			},
 		)
+
+		return "", fmt.Errorf("start sandbox container: %w", err)
 	}
 
-	log.Printf(
-		"[Sandbox] Created and started container %s (ID: %s)",
+	fmt.Printf(
+		"[Sandbox] Started container %s (ID: %s), host port %s\n",
 		containerName,
-		resp.ID[:12],
+		resp.ID,
+		rd.ExposePort,
 	)
 
 	return resp.ID, nil
 }
 
+// WaitForReady waits until a TCP connection can be established.
+// This confirms network reachability, not application-level health.
 func (sr *SandboxRunner) WaitForReady(
+	ctx context.Context,
 	host string,
-	port string,
+	port int,
 	timeout time.Duration,
 ) error {
+	if timeout <= 0 {
+		return fmt.Errorf("readiness timeout must be positive")
+	}
 
-	deadline := time.Now().Add(timeout)
+	waitCtx, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
 
-	target := net.JoinHostPort(host, port)
+	target := net.JoinHostPort(host, strconv.Itoa(port))
+	ticker := time.NewTicker(100 * time.Millisecond)
+	defer ticker.Stop()
 
-	for time.Now().Before(deadline) {
+	var lastErr error
 
-		conn, err := net.DialTimeout(
-			"tcp",
-			target,
-			200*time.Millisecond,
-		)
+	for {
+		dialer := net.Dialer{
+			Timeout: 200 * time.Millisecond,
+		}
 
+		conn, err := dialer.DialContext(waitCtx, "tcp", target)
 		if err == nil {
 			_ = conn.Close()
+			fmt.Printf("[Sandbox] Service reachable at %s\n", target)
 			return nil
 		}
 
-		time.Sleep(100 * time.Millisecond)
-	}
+		lastErr = err
 
-	return fmt.Errorf(
-		"timeout waiting for container service at %s",
-		target,
-	)
+		select {
+		case <-waitCtx.Done():
+			return fmt.Errorf(
+				"service at %s did not become ready within %s: %w (last connection error: %v)",
+				target,
+				timeout,
+				waitCtx.Err(),
+				lastErr,
+			)
+
+		case <-ticker.C:
+			// Retry until ready or the context expires.
+		}
+	}
 }
 
+// StopSandbox stops and removes a container.
+// Pass the container ID returned by StartSandbox.
 func (sr *SandboxRunner) StopSandbox(
 	ctx context.Context,
 	containerID string,
 ) error {
+	if sr == nil || sr.cli == nil {
+		return fmt.Errorf("sandbox runner is not initialized")
+	}
 
-	timeout := 0
+	if strings.TrimSpace(containerID) == "" {
+		return fmt.Errorf("container ID is required")
+	}
 
-	_, err := sr.cli.ContainerStop(
+	timeout := 5
+
+	_, stopErr := sr.cli.ContainerStop(
 		ctx,
 		containerID,
 		client.ContainerStopOptions{
@@ -173,71 +221,59 @@ func (sr *SandboxRunner) StopSandbox(
 		},
 	)
 
-	if err != nil {
+	// Force removal also handles containers that have already stopped.
+	_, removeErr := sr.cli.ContainerRemove(
+		ctx,
+		containerID,
+		client.ContainerRemoveOptions{
+			Force: true,
+		},
+	)
+
+	if stopErr != nil && removeErr != nil {
 		return fmt.Errorf(
-			"failed to stop sandbox: %w",
-			err,
+			"stop container failed: %v; remove container failed: %w",
+			stopErr,
+			removeErr,
 		)
 	}
 
+	if removeErr != nil {
+		return fmt.Errorf("remove sandbox container: %w", removeErr)
+	}
+
+	fmt.Printf("[Sandbox] Stopped and removed container %s\n", shortID(containerID))
 	return nil
 }
 
-func run(rd *runDetails) (string, error) {
+func shortID(id string) string {
+	if len(id) > 12 {
+		return id[:12]
+	}
+	return id
+}
 
-	ctx := context.Background()
+func safeName(s string) string {
+	s = strings.ToLower(strings.TrimSpace(s))
 
-	runner, err := NewSandboxRunner()
-	if err != nil {
-		log.Fatalf(
-			"Failed to initialize Docker SDK: %v",
-			err,
-		)
+	var b strings.Builder
+	for _, r := range s {
+		switch {
+		case r >= 'a' && r <= 'z':
+			b.WriteRune(r)
+		case r >= '0' && r <= '9':
+			b.WriteRune(r)
+		case r == '-' || r == '_':
+			b.WriteRune(r)
+		default:
+			b.WriteByte('-')
+		}
 	}
 
-	log.Println(
-		"--- Starting Step 3: Sandboxing Workflow ---",
-	)
-
-	containerID, err := runner.StartSandbox(
-		ctx,
-		rd,
-	)
-
-	if err != nil {
-		log.Fatalf(
-			"Sandbox Error: %v",
-			err,
-		)
+	result := strings.Trim(b.String(), "-_")
+	if result == "" {
+		return "unknown"
 	}
 
-	log.Println("Probing container health...")
-
-	if err := runner.WaitForReady(
-		"127.0.0.1",
-		rd.exposePort,
-		5*time.Second,
-	); err != nil {
-
-		_ = runner.StopSandbox(
-			ctx,
-			containerID,
-		)
-
-		log.Fatalf(
-			"Healthcheck failed: %v",
-			err,
-		)
-	}
-
-	log.Printf(
-		"Container is HEALTHY and listening on %s/ws",
-		rd.exposePort,
-	)
-
-	log.Println(
-		"Sandbox active. Press Ctrl+C to destroy sandbox...",
-	)
-
-	select {}
+	return result
 }
