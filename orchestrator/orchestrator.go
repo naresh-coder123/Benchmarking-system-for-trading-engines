@@ -66,7 +66,7 @@ func (o *Orchestrator) allocatePort() int {
 }
 
 // HandleCreateRun triggers a new benchmark workflow asynchronously
-func (o *Orchestrator) HandleCreateRun(req *Submission) {
+func (o *Orchestrator) HandleCreateRun(req *Submission) *BenchmarkRun {
 
 	runID := req.SubmitId
 	assignedPort := o.allocatePort()
@@ -85,6 +85,8 @@ func (o *Orchestrator) HandleCreateRun(req *Submission) {
 
 	// Launch workflow asynchronously
 	go o.executeWorkflow(runID)
+
+	return run
 }
 
 // HandleGetStatus checks the status of an ongoing or completed run
@@ -182,7 +184,7 @@ func (o *Orchestrator) executeWorkflow(runID string) {
 		RunID:        runID,
 		NumWorkers:   10,
 		OrdersPerSec: 2000,
-		Duration:     15 * time.Second,
+		Duration:     30 * time.Second,
 	}
 
 	if err := loadgen.RunBenchmark(cfg); err != nil {
